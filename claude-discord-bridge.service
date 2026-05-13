@@ -1,0 +1,12 @@
+[Unit]
+Description=Claude Discord Bridge
+
+[Service]
+Type=simple
+EnvironmentFile=%h/claude-discord-bridge/.env
+WorkingDirectory=%h/claude-discord-bridge
+ExecStart=%h/claude-discord-bridge/venv/bin/python bot.py
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
