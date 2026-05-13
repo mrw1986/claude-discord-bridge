@@ -8,16 +8,47 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+load_env_safe() {
+  local env_file="$1"
+  local line key value first last
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" == *"="* ]] || continue
+
+    key="${line%%=*}"
+    value="${line#*=}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+
+    case "$key" in
+      BRIDGE_TOKEN|BRIDGE_PORT) ;;
+      *) continue ;;
+    esac
+
+    if [ "${#value}" -ge 2 ]; then
+      first="${value:0:1}"
+      last="${value: -1}"
+      if { [ "$first" = '"' ] && [ "$last" = '"' ]; } ||
+         { [ "$first" = "'" ] && [ "$last" = "'" ]; }; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+
+    case "$key" in
+      BRIDGE_TOKEN) BRIDGE_TOKEN="$value" ;;
+      BRIDGE_PORT) BRIDGE_PORT="$value" ;;
+    esac
+  done < "$env_file"
+}
+
 if ! command -v jq >/dev/null 2>&1; then
   echo "notify.sh: jq is required; install with: sudo dnf install -y jq" >&2
   exit 0
 fi
 
-if [ -z "${BRIDGE_TOKEN:-}" ] && [ -f "$SCRIPT_DIR/.env" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  . "$SCRIPT_DIR/.env"
-  set +a
+if [ -z "${BRIDGE_TOKEN:-}" ] && [ -r "$SCRIPT_DIR/.env" ]; then
+  load_env_safe "$SCRIPT_DIR/.env"
 fi
 
 if [ -z "${BRIDGE_TOKEN:-}" ]; then
@@ -143,10 +174,26 @@ PAYLOAD="$(jq -n \
   '{project:$project, branch:$branch, agent:$agent, event:$event, message:$msg, tmux_pane:$pane, transcript_path:$transcript}
    + (if ($pane_pid | test("^[0-9]+$")) then {tmux_pane_pid:($pane_pid | tonumber)} else {} end)')"
 
+config_file="$(mktemp -p "${XDG_RUNTIME_DIR:-/tmp}" curl-bridge.XXXXXX 2>/dev/null || mktemp /tmp/curl-bridge.XXXXXX 2>/dev/null || true)"
+if [ -z "$config_file" ]; then
+  echo "notify.sh: failed to create curl config; skipping bridge notification" >&2
+  exit 0
+fi
+chmod 600 "$config_file" || {
+  rm -f "$config_file"
+  echo "notify.sh: failed to secure curl config; skipping bridge notification" >&2
+  exit 0
+}
+trap 'rm -f "${config_file:-}"' EXIT
+printf 'header = "X-Bridge-Token: %s"\n' "$BRIDGE_TOKEN" > "$config_file" || {
+  echo "notify.sh: failed to write curl config; skipping bridge notification" >&2
+  exit 0
+}
+
 curl -s --max-time 3 \
+  --config "$config_file" \
   -X POST "http://127.0.0.1:${PORT}/notify" \
   -H 'Content-Type: application/json' \
-  -H "X-Bridge-Token: ${BRIDGE_TOKEN}" \
   -d "$PAYLOAD" >/dev/null 2>&1 || true
 
 exit 0

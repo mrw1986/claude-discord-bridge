@@ -7,6 +7,26 @@ EnvironmentFile=%h/claude-discord-bridge/.env
 WorkingDirectory=%h/claude-discord-bridge
 ExecStart=%h/claude-discord-bridge/venv/bin/python bot.py
 Restart=on-failure
+NoNewPrivileges=true
+# PrivateTmp is intentionally not enabled; tmux needs the user's socket under /tmp.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/claude-discord-bridge %h/.local/share/claude-discord-bridge
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
 
 [Install]
 WantedBy=default.target

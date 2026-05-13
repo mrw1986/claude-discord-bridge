@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +35,11 @@ ALLOWED_MENTIONS = discord.AllowedMentions.none()
 INBOX_ROOT = Path.home() / ".local/share/claude-discord-bridge/inbox"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 SAFE_ATTACHMENT_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+ALLOWED_EVENTS = {"notify", "notification", "stop", "subagent_stop", "error"}
+TMUX_PANE_RE = re.compile(r"^%[0-9]+(@[A-Za-z0-9_-]{1,64})?$")
+NOTIFY_RATE_LIMIT = 30
+NOTIFY_RATE_WINDOW = 60.0
+NOTIFY_RATE_MAX_KEYS = 1024
 
 
 def required_env(name: str) -> str:
@@ -91,7 +97,7 @@ def parse_optional_int(payload: dict, key: str) -> int | None:
     else:
         logger.warning("Ignoring invalid integer payload field %s=%r", key, raw)
         return None
-    if value <= 0:
+    if value < 0:
         logger.warning("Ignoring invalid integer payload field %s=%r", key, raw)
         return None
     return value
@@ -113,6 +119,7 @@ session_locks: dict[str, asyncio.Lock] = {}
 session_locks_guard = asyncio.Lock()
 state_write_lock = asyncio.Lock()
 transcript_cache: dict[str, tuple[float, int, str]] = {}
+notify_rate_limits: OrderedDict[str, list[float]] = OrderedDict()
 
 
 def load_state() -> None:
@@ -145,6 +152,89 @@ async def save_state() -> None:
 
 def session_key(project: str, branch: str, agent: str, pane: str) -> str:
     return f"{project}|{branch}|{agent}|{pane}"
+
+
+def _validate_str_field(
+    payload: dict,
+    field: str,
+    default: str,
+    min_len: int,
+    max_len: int,
+    *,
+    strip: bool = False,
+) -> tuple[str | None, str | None]:
+    if field not in payload:
+        value = default
+    else:
+        value = payload[field]
+    if not isinstance(value, str):
+        return None, f"{field}: must be a string"
+    if strip:
+        value = value.strip()
+    if len(value) < min_len:
+        return None, f"{field}: must be at least {min_len} character(s)"
+    if len(value) > max_len:
+        return None, f"{field}: must be at most {max_len} character(s)"
+    return value, None
+
+
+def validate_notify_payload(payload: dict) -> tuple[dict, str | None]:
+    normalized: dict = {}
+
+    for field, default, min_len, max_len, strip in (
+        ("project", "unknown", 1, 200, False),
+        ("branch", "", 0, 200, True),
+        ("agent", "default", 1, 100, False),
+        ("event", "notify", 1, 100, False),
+        ("message", "", 0, 2000, True),
+        ("tmux_pane", "", 0, 200, False),
+        ("transcript_path", "", 0, 4096, False),
+    ):
+        value, error = _validate_str_field(
+            payload, field, default, min_len, max_len, strip=strip
+        )
+        if error is not None:
+            return {}, error
+        normalized[field] = value
+
+    if normalized["event"] not in ALLOWED_EVENTS:
+        return {}, "event: unsupported event"
+
+    pane = normalized["tmux_pane"]
+    if pane and TMUX_PANE_RE.fullmatch(pane) is None:
+        return {}, "tmux_pane: invalid format"
+
+    raw_pane_pid = payload.get("tmux_pane_pid")
+    if "tmux_pane_pid" not in payload or raw_pane_pid is None:
+        normalized["tmux_pane_pid"] = None
+    elif isinstance(raw_pane_pid, bool) or not isinstance(raw_pane_pid, int):
+        return {}, "tmux_pane_pid: must be an integer or null"
+    elif raw_pane_pid < 0 or raw_pane_pid > 2**31:
+        return {}, "tmux_pane_pid: must be between 0 and 2147483648"
+    else:
+        normalized["tmux_pane_pid"] = raw_pane_pid
+
+    return normalized, None
+
+
+def check_notify_rate_limit(key: str) -> tuple[bool, int]:
+    now = time.monotonic()
+    cutoff = now - NOTIFY_RATE_WINDOW
+    timestamps = notify_rate_limits.get(key, [])
+    timestamps = [ts for ts in timestamps if ts > cutoff]
+
+    if len(timestamps) >= NOTIFY_RATE_LIMIT:
+        notify_rate_limits[key] = timestamps
+        notify_rate_limits.move_to_end(key)
+        retry_after = max(1, int(NOTIFY_RATE_WINDOW - (now - timestamps[0])) + 1)
+        return False, retry_after
+
+    timestamps.append(now)
+    notify_rate_limits[key] = timestamps
+    notify_rate_limits.move_to_end(key)
+    while len(notify_rate_limits) > NOTIFY_RATE_MAX_KEYS:
+        notify_rate_limits.popitem(last=False)
+    return True, 0
 
 
 async def get_session_lock(key: str) -> asyncio.Lock:
@@ -282,9 +372,19 @@ async def find_or_create_thread(
 
         thread = await channel.create_thread(
             name=build_title(project, branch, agent),
-            type=discord.ChannelType.public_thread,
+            type=discord.ChannelType.private_thread,
             auto_archive_duration=AUTO_ARCHIVE_MINUTES,
         )
+        invite_user_ids = set(DISCORD_ALLOWED_USER_IDS)
+        if DISCORD_PING_USER_ID is not None:
+            invite_user_ids.add(DISCORD_PING_USER_ID)
+        for uid in invite_user_ids:
+            try:
+                await thread.add_user(discord.Object(id=uid))
+            except discord.HTTPException:
+                logger.warning(
+                    "Failed to add user %s to private thread %s", uid, thread.id
+                )
         threads[thread.id] = {
             "tmux_pane": pane,
             "project": project,
@@ -346,10 +446,19 @@ def pane_for_state(base_cmd: list[str], pane_id: str) -> str:
 async def resolve_pane(pane: str, pane_pid: int | None) -> tuple[list[str], str]:
     base_cmd, pane_id = tmux_base_and_target(pane)
     try:
-        await run_tmux_command(
-            base_cmd + ["display-message", "-p", "-t", pane_id, "#{pane_pid}"]
+        current_pid = (
+            await run_tmux_command(
+                base_cmd + ["display-message", "-p", "-t", pane_id, "#{pane_pid}"]
+            )
+        ).strip()
+        if pane_pid is None or current_pid == str(pane_pid):
+            return base_cmd, pane_id
+        logger.warning(
+            "Cached tmux pane %s is stale: current pid %s != stored pid %s",
+            pane,
+            current_pid,
+            pane_pid,
         )
-        return base_cmd, pane_id
     except TmuxCommandError:
         pass
 
@@ -505,7 +614,9 @@ async def on_message(message: discord.Message) -> None:
 
 
 async def handle_notify(request: web.Request) -> web.Response:
-    if request.headers.get("X-Bridge-Token") != BRIDGE_TOKEN:
+    if not secrets.compare_digest(
+        request.headers.get("X-Bridge-Token", ""), BRIDGE_TOKEN
+    ):
         logger.warning("/notify auth failure from %s", request.remote or "unknown")
         return web.json_response({"error": "unauthorized"}, status=401)
 
@@ -514,14 +625,30 @@ async def handle_notify(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         return web.json_response({"error": "invalid json"}, status=400)
 
-    project = payload.get("project", "unknown")
-    branch = (payload.get("branch") or "").strip()
-    agent = payload.get("agent", "default")
-    event = payload.get("event", "notify")
-    msg = (payload.get("message") or "").strip()
-    pane = payload.get("tmux_pane") or ""
-    pane_pid = parse_optional_int(payload, "tmux_pane_pid")
-    transcript_path = payload.get("transcript_path") or ""
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "payload: must be an object"}, status=400)
+
+    normalized, error = validate_notify_payload(payload)
+    if error is not None:
+        return web.json_response({"error": error}, status=400)
+
+    project = normalized["project"]
+    branch = normalized["branch"]
+    agent = normalized["agent"]
+    event = normalized["event"]
+    msg = normalized["message"]
+    pane = normalized["tmux_pane"]
+    pane_pid = normalized["tmux_pane_pid"]
+    transcript_path = normalized["transcript_path"]
+
+    rate_key = session_key(project, branch, agent, pane)
+    allowed, retry_after = check_notify_rate_limit(rate_key)
+    if not allowed:
+        return web.json_response(
+            {"error": "rate limited"},
+            status=429,
+            headers={"Retry-After": str(retry_after)},
+        )
 
     channel = bot.get_channel(CHANNEL_ID)
     if channel is None:
